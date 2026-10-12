@@ -1,0 +1,263 @@
+#!/usr/bin/env python3
+"""entire rehearsal: which agent session changed your AI agent's instructions, and does that version still work?
+
+An Entire CLI plugin. Entire records the coding-agent session behind every commit as a checkpoint. Rehearsal
+tests an AI agent on a sandboxed copy of a real application and decides every outcome from the application's
+database. This plugin joins the two for one file, the agent's instructions (its system prompt):
+
+  entire rehearsal history PROMPT_FILE            commits that changed it, with the checkpoint and coding agent behind each
+  entire rehearsal check PROMPT_FILE --world WV   rehearse the current version on a Rehearsal world (spends model budget)
+  entire rehearsal attach RUN_ID PROMPT_FILE      record an existing Rehearsal run against the commit that last changed it
+  entire rehearsal report PROMPT_FILE             each change next to its rehearsal result, so a regression shows its session
+
+check and attach need the Rehearsal client (pip install rehearsal-kit) and a sign-in (rehearsal login).
+Results are kept in the plugin's data directory, per repository.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+__version__ = "0.1.0"
+READY_SUCCESS, READY_MIN_EPISODES = 0.8, 3  # the same bar as Rehearsal's "Ready to pilot"
+
+
+# --------------------------------------------------------------------------- git and entire
+
+
+def git(*args: str) -> str:
+    return subprocess.run(["git", *args], check=True, capture_output=True, text=True).stdout
+
+
+def repo_root() -> Path:
+    return Path(os.environ.get("ENTIRE_REPO_ROOT") or git("rev-parse", "--show-toplevel").strip())
+
+
+def changes(path: str, limit: int = 50) -> list[dict[str, str]]:
+    """Commits that changed the file, newest first, with their Entire-Checkpoint trailer."""
+    fmt = "%H%x1f%cI%x1f%an%x1f%s%x1f%(trailers:key=Entire-Checkpoint,valueonly,separator=%x2c)%x1e"
+    out = git("log", "--follow", f"-n{limit}", f"--format={fmt}", "--", path)
+    rows = []
+    for record in out.split("\x1e"):
+        parts = record.strip("\n").split("\x1f")
+        if len(parts) == 5:
+            sha, date, author, subject, trailer = parts
+            rows.append({"commit": sha, "date": date, "author": author, "subject": subject, "checkpoint": trailer.split(",")[0].strip()})
+    return rows
+
+
+def session_of(checkpoint: str) -> dict[str, str]:
+    """The coding agent and model behind a checkpoint, read from `entire checkpoint explain --json`."""
+    if not checkpoint:
+        return {}
+    try:
+        out = subprocess.run(["entire", "checkpoint", "explain", checkpoint, "--json"], capture_output=True, text=True, timeout=60)
+        data = json.loads(out.stdout)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return {}
+    sessions = (data.get("sessions") or []) if isinstance(data, dict) else []
+    first = sessions[0] if sessions else {}
+    return {"agent": first.get("agent", ""), "model": first.get("model", ""), "session": first.get("session_id", "")}
+
+
+# --------------------------------------------------------------------------- results store
+
+
+def store() -> Path:
+    base = Path(os.environ.get("ENTIRE_PLUGIN_DATA_DIR") or Path.home() / ".local/share/entire/plugins/data/rehearsal")
+    key = hashlib.sha256(str(repo_root()).encode()).hexdigest()[:16]
+    base.mkdir(parents=True, exist_ok=True)
+    return base / f"results-{key}.jsonl"
+
+
+def load(path: str) -> dict[str, dict]:
+    """The latest recorded result per commit for this file."""
+    results: dict[str, dict] = {}
+    try:
+        for line in store().read_text().splitlines():
+            r = json.loads(line)
+            if r.get("file") == path:
+                results[r["commit"]] = r
+    except (OSError, ValueError):
+        pass
+    return results
+
+
+def save(record: dict) -> None:
+    with store().open("a") as f:
+        f.write(json.dumps(record) + "\n")
+
+
+def verdict(overall: dict) -> str:
+    """Rehearsal's readiness bar applied to one run: enough finished episodes, a high verified rate, no rule
+    violations, no false "done" claims."""
+    finished, rate = overall.get("finished") or 0, overall.get("success_rate")
+    if finished < READY_MIN_EPISODES or rate is None:
+        return "not enough episodes"
+    if rate >= READY_SUCCESS and not overall.get("hard_violation_episodes") and not overall.get("false_completions"):
+        return "ready to pilot"
+    return "needs work"
+
+
+def describe(overall: dict) -> str:
+    rate = overall.get("success_rate")
+    return (f"{'—' if rate is None else f'{rate:.0%}'} verified of {overall.get('finished', 0)} episodes, "
+            f"{overall.get('hard_violation_episodes', 0)} rule violations, {overall.get('false_completions', 0)} false 'done', "
+            f"{overall.get('duplicate_effects', 0)} duplicate effects")
+
+
+# --------------------------------------------------------------------------- Rehearsal
+
+
+def client():
+    try:
+        from rehearsal.sdk import Rehearsal
+    except ImportError:
+        sys.exit("entire rehearsal: the Rehearsal client is missing. Install it with: pip install rehearsal-kit")
+    return Rehearsal()
+
+
+def record_run(rh, run_id: str, path: str, commit: str, checkpoint: str, extra: dict | None = None) -> dict:
+    run = rh.runs.get(run_id)
+    overall = (run.get("summary") or {}).get("overall") or {}
+    record = {"file": path, "commit": commit, "checkpoint": checkpoint, "run_id": run_id, "world_version_id": run.get("world_version_id"),
+              "status": run.get("status"), "overall": overall, "verdict": verdict(overall) if run.get("status") == "finished" else run.get("status"),
+              "recorded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"), **(extra or {})}
+    save(record)
+    return record
+
+
+def relpath(path: str) -> str:
+    """The file as git names it, relative to the repository root."""
+    p = Path(path).resolve()
+    try:
+        return str(p.relative_to(repo_root().resolve()))
+    except ValueError:
+        sys.exit(f"entire rehearsal: {path} is not inside this repository")
+
+
+# --------------------------------------------------------------------------- commands
+
+
+def cmd_history(a: argparse.Namespace) -> None:
+    path = relpath(a.file)
+    rows = changes(path, a.limit)
+    if not rows:
+        sys.exit(f"entire rehearsal: no commits changed {path}")
+    results = load(path)
+    print(f"Changes to {path}, newest first\n")
+    for r in rows:
+        s = session_of(r["checkpoint"])
+        who = f"{s['agent']} ({s['model']})" if s.get("agent") else ("no checkpoint" if not r["checkpoint"] else "checkpoint not available here")
+        print(f"{r['commit'][:8]}  {r['date'][:16].replace('T', ' ')}  {r['subject'][:70].rstrip()}")
+        print(f"          checkpoint {r['checkpoint'] or '—'} · {who}")
+        if res := results.get(r["commit"]):
+            print(f"          rehearsal  {res['verdict']}: {describe(res['overall'])}  [{res['run_id']}]")
+
+
+def cmd_check(a: argparse.Namespace) -> None:
+    path = relpath(a.file)
+    rows = changes(path, 1)
+    if not rows:
+        sys.exit(f"entire rehearsal: commit {path} first, so the result can be tied to the change that made it")
+    head = rows[0]
+    dirty = bool(git("status", "--porcelain", "--", path).strip())
+    if dirty:
+        print(f"warning: {path} has uncommitted changes; the result is recorded against {head['commit'][:8]} and marked dirty")
+    if not a.yes:
+        if not sys.stdin.isatty():
+            sys.exit("entire rehearsal: check starts an evaluation that spends model budget; pass --yes to confirm")
+        if input("This starts a Rehearsal evaluation, which spends model budget. Continue? [y/N] ").strip().lower() != "y":
+            sys.exit("cancelled")
+    rh = client()
+    prompt = Path(a.file).read_text()
+    name = a.name or Path(path).stem
+    profile = rh.profiles.create(name, system_prompt=prompt, **({"model": a.model} if a.model else {}))
+    ev = rh.evaluations.create(a.world, [profile["id"]], splits=[a.split], repeats=a.repeats)
+    run_id = ev["run_id"]
+    print(f"rehearsing {name} v{profile.get('version', '?')} on {a.world} ({a.split}): run {run_id}, {ev.get('episodes', '?')} episodes")
+    extra = {"profile_id": profile["id"], "split": a.split, "dirty": dirty}
+    if a.no_wait:
+        record_run(rh, run_id, path, head["commit"], head["checkpoint"], extra)
+        print(f"started; later run: entire rehearsal attach {run_id} {a.file}")
+        return
+    while (status := rh.runs.get(run_id).get("status")) not in ("finished", "failed", "cancelled"):
+        time.sleep(10)
+    res = record_run(rh, run_id, path, head["commit"], head["checkpoint"], extra)
+    print(f"{res['verdict']}: {describe(res['overall'])}" if status == "finished" else f"run {status}")
+
+
+def cmd_attach(a: argparse.Namespace) -> None:
+    path = relpath(a.file)
+    rows = changes(path, 200)
+    if not rows:
+        sys.exit(f"entire rehearsal: no commits changed {path}")
+    target = rows[0] if not a.commit else next((r for r in rows if r["commit"].startswith(a.commit)), None)
+    if target is None:
+        sys.exit(f"entire rehearsal: {a.commit} did not change {path}")
+    res = record_run(client(), a.run_id, path, target["commit"], target["checkpoint"])
+    print(f"recorded {a.run_id} for {target['commit'][:8]} ({target['checkpoint'] or 'no checkpoint'}): {res['verdict']}, {describe(res['overall'])}")
+
+
+def cmd_report(a: argparse.Namespace) -> None:
+    path = relpath(a.file)
+    rows, results = changes(path, a.limit), load(path)
+    checked = [r for r in rows if r["commit"] in results]
+    if not checked:
+        sys.exit(f"entire rehearsal: no rehearsal results for {path} yet; run `entire rehearsal check {a.file} --world <id>`")
+    print(f"Rehearsal results for {path}, newest first\n")
+    older = list(reversed(checked))
+    for i, r in enumerate(older):
+        res = results[r["commit"]]
+        rate = (res["overall"] or {}).get("success_rate")
+        prev = (results[older[i - 1]["commit"]]["overall"] or {}).get("success_rate") if i else None
+        r["change"] = "" if rate is None or prev is None else (" ▲ better" if rate > prev else " ▼ REGRESSION" if rate < prev else " = same")
+    for r in checked:
+        res, s = results[r["commit"]], session_of(r["checkpoint"])
+        print(f"{r['commit'][:8]}  {res['verdict']}{r['change']}  {describe(res['overall'])}")
+        print(f"          {r['subject'][:70].rstrip()}")
+        if r["checkpoint"]:
+            print(f"          changed in checkpoint {r['checkpoint']}" + (f" by {s['agent']} ({s['model']})" if s.get("agent") else ""))
+        else:
+            print("          changed without an Entire checkpoint")
+    if any("REGRESSION" in r["change"] for r in checked):
+        print("\nRead the session behind a regression with: entire checkpoint explain <checkpoint>")
+
+
+def main(argv: list[str] | None = None) -> None:
+    p = argparse.ArgumentParser(prog="entire rehearsal", description=__doc__.split("\n\n")[0])
+    p.add_argument("--version", action="version", version=f"entire-rehearsal {__version__}")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    h = sub.add_parser("history", help="commits that changed the agent's instructions, with their Entire checkpoints")
+    h.add_argument("file"); h.add_argument("--limit", type=int, default=20)
+    c = sub.add_parser("check", help="rehearse the current version on a Rehearsal world (spends model budget)")
+    c.add_argument("file"); c.add_argument("--world", required=True, help="published world version id (rehearsal worlds list)")
+    c.add_argument("--split", default="dev", choices=["train", "dev", "holdout"]); c.add_argument("--repeats", type=int, default=1)
+    c.add_argument("--name", help="agent profile name (default: the file name)"); c.add_argument("--model", help="model chain for the agent")
+    c.add_argument("--yes", action="store_true", help="do not ask before spending model budget")
+    c.add_argument("--no-wait", action="store_true", help="start the run and record it without waiting")
+    t = sub.add_parser("attach", help="record an existing Rehearsal run against a change")
+    t.add_argument("run_id"); t.add_argument("file"); t.add_argument("--commit", help="the change to record it against (default: the latest)")
+    r = sub.add_parser("report", help="each change next to its rehearsal result")
+    r.add_argument("file"); r.add_argument("--limit", type=int, default=50)
+    a = p.parse_args(argv)
+    try:
+        {"history": cmd_history, "check": cmd_check, "attach": cmd_attach, "report": cmd_report}[a.cmd](a)
+    except subprocess.CalledProcessError as exc:
+        sys.exit(f"entire rehearsal: {' '.join(exc.cmd[:2])} failed: {exc.stderr.strip()[:300]}")
+    except Exception as exc:  # the Rehearsal client raises RehearsalError with the server's reason
+        if type(exc).__name__ == "RehearsalError":
+            sys.exit(f"entire rehearsal: Rehearsal refused the request: {exc}")
+        raise
+
+
+if __name__ == "__main__":
+    main()
